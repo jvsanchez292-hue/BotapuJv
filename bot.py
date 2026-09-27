@@ -7,6 +7,7 @@ from models.value_bet import detectar_value_bet
 from services.api_football import obtener_prediccion, buscar_fixture
 from services.odds_api import obtener_cuotas
 from services.bankroll import kelly_stake
+from services.ligas import LIGAS, normalizar_nombre
 
 logging.basicConfig(level=logging.INFO)
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -16,26 +17,41 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚽ *Bot de Apuestas Estadísticas*\n\n"
         "Comandos disponibles:\n"
-        "/analizar Equipo1 vs Equipo2\n"
-        "/value - Value bets del día\n"
+        "/analizar Equipo1 | Equipo2 - Analiza un partido\n"
+        "/hoy - Value bets del día\n"
         "/bankroll - Estado actual\n"
         "/historial - Últimas apuestas\n",
         parse_mode="Markdown"
     )
 
 async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if len(args) < 3 or args[1].lower() != "vs":
-        await update.message.reply_text("Uso: /analizar Real Madrid vs Barcelona")
+    texto = " ".join(context.args)
+    if "|" not in texto:
+        await update.message.reply_text(
+            "Uso: /analizar Real Madrid | Barcelona\n"
+            "(usa la barra vertical `|` entre los equipos)",
+            parse_mode="Markdown"
+        )
         return
 
-    local, visitante = args[0], args[2]
+    partes = texto.split("|")
+    if len(partes) != 2:
+        await update.message.reply_text("Formato: /analizar Equipo1 | Equipo2")
+        return
+
+    local = partes[0].strip()
+    visitante = partes[1].strip()
+
     await update.message.reply_text(f"🔍 Buscando {local} vs {visitante}...")
 
     try:
         fixture = buscar_fixture(local, visitante)
         if not fixture:
-            await update.message.reply_text("❌ No encontré ese partido próximamente.")
+            await update.message.reply_text(
+                f"❌ No encontré *{local} vs {visitante}* próximamente.\n"
+                "Prueba con nombres más oficiales o revisa `/hoy`.",
+                parse_mode="Markdown"
+            )
             return
 
         pred = obtener_prediccion(fixture["id"])
@@ -47,7 +63,7 @@ async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         p_empate = pred["predictions"]["percent"]["draw"] / 100
         p_visit = pred["predictions"]["percent"]["away"] / 100
 
-        cuotas = obtener_cuotas(local, visitante)
+        cuotas = obtener_cuotas(local, visitante, liga=fixture.get("liga", "soccer_spain_la_liga"))
         if not cuotas:
             await update.message.reply_text("⚠️ Sin cuotas disponibles todavía.")
             return
@@ -58,6 +74,7 @@ async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mensaje += f"• Empate: {p_empate:.1%}\n"
         mensaje += f"• Visitante: {p_visit:.1%}\n\n"
 
+        hay_value = False
         for mercado, prob, cuota in [
             ("Local", p_local, cuotas.get("home")),
             ("Empate", p_empate, cuotas.get("draw")),
@@ -67,12 +84,16 @@ async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
             info = detectar_value_bet(prob, cuota)
             if info["es_value"]:
+                hay_value = True
                 stake = kelly_stake(prob, cuota, BANKROLL_INICIAL)
                 mensaje += (
                     f"✅ *VALUE BET: {mercado}*\n"
                     f"Cuota: {cuota} | Prob: {prob:.1%}\n"
                     f"Edge: {info['edge']:.1%} | Stake: ${stake}\n\n"
                 )
+
+        if not hay_value:
+            mensaje += "❌ No hay value bets claros en este partido."
 
         await update.message.reply_text(mensaje, parse_mode="Markdown")
 
@@ -89,11 +110,15 @@ async def bankroll(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📜 Historial en construcción.")
 
+async def hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🕐 Comando /hoy en construcción. Vuelve pronto.")
+
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("analizar", analizar))
     app.add_handler(CommandHandler("bankroll", bankroll))
     app.add_handler(CommandHandler("historial", historial))
+    app.add_handler(CommandHandler("hoy", hoy))
     print("✅ Bot corriendo...")
     app.run_polling()
