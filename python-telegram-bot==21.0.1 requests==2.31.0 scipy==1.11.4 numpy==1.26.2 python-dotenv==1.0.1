@@ -1,0 +1,211 @@
+import os
+import logging
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from models.poisson import PoissonModel
+from models.value_bet import detectar_value_bet
+from services.api_football import obtener_prediccion, buscar_fixture
+from services.odds_api import obtener_cuotas
+from services.bankroll import kelly_stake
+
+logging.basicConfig(level=logging.INFO)
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+BANKROLL_INICIAL = float(os.environ.get("BANKROLL", "100"))
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "⚽ *Bot de Apuestas Estadísticas*\n\n"
+        "Comandos disponibles:\n"
+        "/analizar Equipo1 vs Equipo2\n"
+        "/value - Value bets del día\n"
+        "/bankroll - Estado actual\n"
+        "/historial - Últimas apuestas\n",
+        parse_mode="Markdown"
+    )
+
+async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if len(args) < 3 or args[1].lower() != "vs":
+        await update.message.reply_text("Uso: /analizar Real Madrid vs Barcelona")
+        return
+
+    local, visitante = args[0], args[2]
+    await update.message.reply_text(f"🔍 Buscando {local} vs {visitante}...")
+
+    try:
+        fixture = buscar_fixture(local, visitante)
+        if not fixture:
+            await update.message.reply_text("❌ No encontré ese partido próximamente.")
+            return
+
+        pred = obtener_prediccion(fixture["id"])
+        if not pred:
+            await update.message.reply_text("❌ Sin predicción disponible.")
+            return
+
+        # Predicciones de API-Football (en %)
+        p_local = pred["predictions"]["percent"]["home"] / 100
+        p_empate = pred["predictions"]["percent"]["draw"] / 100
+        p_visit = pred["predictions"]["percent"]["away"] / 100
+
+        cuotas = obtener_cuotas(local, visitante)
+        if not cuotas:
+            await update.message.reply_text("⚠️ Sin cuotas disponibles todavía.")
+            return
+
+        mensaje = f"📊 *{local} vs {visitante}*\n\n"
+        mensaje += f"Probabilidades modelo:\n"
+        mensaje += f"• Local: {p_local:.1%}\n"
+        mensaje += f"• Empate: {p_empate:.1%}\n"
+        mensaje += f"• Visitante: {p_visit:.1%}\n\n"
+
+        for mercado, prob, cuota in [
+            ("Local", p_local, cuotas.get("home")),
+            ("Empate", p_empate, cuotas.get("draw")),
+            ("Visitante", p_visit, cuotas.get("away")),
+        ]:
+            if not cuota:
+                continue
+            info = detectar_value_bet(prob, cuota)
+            if info["es_value"]:
+                stake = kelly_stake(prob, cuota, BANKROLL_INICIAL)
+                mensaje += (
+                    f"✅ *VALUE BET: {mercado}*\n"
+                    f"Cuota: {cuota} | Prob: {prob:.1%}\n"
+                    f"Edge: {info['edge']:.1%} | Stake: ${stake}\n\n"
+                )
+
+        await update.message.reply_text(mensaje, parse_mode="Markdown")
+
+    except Exception as e:
+        logging.error(f"Error: {e}")
+        await update.message.reply_text(f"⚠️ Error: {e}")
+
+async def bankroll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"💰 Bankroll actual: ${BANKROLL_INICIAL:.2f}\n"
+        f"(Configúralo en la variable BANKROLL de Railway)"
+    )
+
+async def historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📜 Historial en construcción.")
+
+if __name__ == "__main__":
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("analizar", analizar))
+    app.add_handler(CommandHandler("bankroll", bankroll))
+    app.add_handler(CommandHandler("historial", historial))
+    print("✅ Bot corriendo...")
+    app.run_polling()import numpy as np
+from scipy.stats import poisson
+
+class PoissonModel:
+    def __init__(self, lambda_local, lambda_visitante):
+        self.ll = lambda_local
+        self.lv = lambda_visitante
+
+    def prob_1x2(self, max_goles=6):
+        p_l = p_e = p_v = 0.0
+        for i in range(max_goles + 1):
+            for j in range(max_goles + 1):
+                p = poisson.pmf(i, self.ll) * poisson.pmf(j, self.lv)
+                if i > j:
+                    p_l += p
+                elif i == j:
+                    p_e += p
+                else:
+                    p_v += p
+        return p_l, p_e, p_vimport os
+import requests
+
+API_KEY = os.environ.get("RAPIDAPI_KEY")
+HOST = "v3.football.api-sports.io"
+BASE = f"https://{HOST}"
+
+HEADERS = {
+    "X-RapidAPI-Key": API_KEY,
+    "X-RapidAPI-Host": HOST,
+}
+
+def buscar_fixture(local, visitante, fecha=None):
+    """Busca un partido por nombres de equipos."""
+    url = f"{BASE}/fixtures"
+    params = {"next": 20}  # próximos 20 partidos
+    r = requests.get(url, headers=HEADERS, params=params)
+    if r.status_code != 200:
+        return None
+
+    data = r.json().get("response", [])
+    local_l = local.lower()
+    visit_l = visitante.lower()
+
+    for fx in data:
+        home = fx["teams"]["home"]["name"].lower()
+        away = fx["teams"]["away"]["name"].lower()
+        if local_l in home and visit_l in away:
+            return {"id": fx["fixture"]["id"], "raw": fx}
+    return None
+
+def obtener_prediccion(fixture_id):
+    """Obtiene la predicción de API-Football."""
+    url = f"{BASE}/predictions"
+    params = {"fixture": fixture_id}
+    r = requests.get(url, headers=HEADERS, params=params)
+    if r.status_code != 200:
+        return None
+    data = r.json().get("response", [])
+    return data[0] if data else Noneimport os
+import requests
+
+ODDS_KEY = os.environ.get("ODDS_API_KEY")
+BASE = "https://api.the-odds-api.com/v4"
+
+def obtener_cuotas(local, visitante, liga="soccer_spain_la_liga"):
+    """Devuelve las cuotas promedio de la casa Pinnacle o similar."""
+    url = f"{BASE}/sports/{liga}/odds"
+    params = {
+        "apiKey": ODDS_KEY,
+        "regions": "eu",
+        "markets": "h2h",
+        "oddsFormat": "decimal",
+    }
+    r = requests.get(url, params=params)
+    if r.status_code != 200:
+        return None
+
+    partidos = r.json()
+    local_l = local.lower()
+    visit_l = visitante.lower()
+
+    for p in partidos:
+        home = p.get("home_team", "").lower()
+        away = p.get("away_team", "").lower()
+        if local_l in home and visit_l in away:
+            cuotas = {"home": [], "draw": [], "away": []}
+            for book in p.get("bookmakers", []):
+                for mkt in book.get("markets", []):
+                    if mkt["key"] == "h2h":
+                        for out in mkt["outcomes"]:
+                            name = out["name"].lower()
+                            if name == home:
+                                cuotas["home"].append(out["price"])
+                            elif name == away:
+                                cuotas["away"].append(out["price"])
+                            else:
+                                cuotas["draw"].append(out["price"])
+            return {
+                "home": max(cuotas["home"]) if cuotas["home"] else None,
+                "draw": max(cuotas["draw"]) if cuotas["draw"] else None,
+                "away": max(cuotas["away"]) if cuotas["away"] else None,
+            }
+    return Nonedef kelly_stake(prob, cuota, bankroll, fraccion=0.25):
+    """Kelly fraccionado. fraccion=0.25 → 1/4 Kelly (recomendado)."""
+    b = cuota - 1
+    p = prob
+    q = 1 - p
+    if b <= 0:
+        return 0.0
+    f = (b * p - q) / b
+    f = max(0.0, f) * fraccion
+    return round(bankroll * f, 2)
