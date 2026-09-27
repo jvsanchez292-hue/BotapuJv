@@ -121,4 +121,4 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("historial", historial))
     app.add_handler(CommandHandler("hoy", hoy))
     print("✅ Bot corriendo...")
-    app.run_polling()
+    app.run_polling() 
